@@ -16,13 +16,17 @@ Dependencies: streamlit, pillow
 """
 
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFile
 import io
 import zipfile
 import os
 import math
 import tempfile
 from typing import List, Tuple
+import gc
+
+# Make PIL tolerant to truncated/streamed images
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # ----------------------- Helpers -----------------------
 
@@ -196,6 +200,9 @@ st.header('Conversion')
 output_name = st.text_input('Base name for download file (zip will use this as prefix)', value='resized_images')
 run = st.button('Start Conversion')
 
+# Chunk configuration (backend only, UI unchanged)
+CHUNK_SIZE = 10  # processing chunk size (user selected value)
+
 # Perform conversion
 if run and images:
     st.info('Starting conversion — processing images now...')
@@ -203,85 +210,99 @@ if run and images:
     output_files = []  # list of (name, bytes)
     progress = st.progress(0)
     total = len(images)
-    i = 0
+    processed = 0
 
-    for fname, fbytes in images:
-        i += 1
-        try:
-            img = pil_from_bytes(fbytes)
-        except Exception as e:
-            st.warning(f"Skipping {fname}: cannot open as image ({e})")
-            continue
+    # Process images in chunks to avoid long single loops and to allow GC between chunks
+    for start_idx in range(0, total, CHUNK_SIZE):
+        chunk = images[start_idx:start_idx + CHUNK_SIZE]
 
-        orig_size = len(fbytes)
-        orig_w, orig_h = img.size
+        for fname, fbytes in chunk:
+            processed += 1
+            try:
+                img = pil_from_bytes(fbytes)
+            except Exception as e:
+                st.warning(f"Skipping {fname}: cannot open as image ({e})")
+                continue
 
-        # Decide output format
-        fmt = output_format
-        if fmt == 'KEEP (original)':
-            fmt = os.path.splitext(fname)[1].replace('.', '').upper() or 'JPEG'
-            if fmt == 'JPG':
-                fmt = 'JPEG'
-        fmt = fmt.upper()
+            orig_size = len(fbytes)
+            orig_w, orig_h = img.size
 
-        converted = None
-        used_quality = None
+            # Decide output format
+            fmt = output_format
+            if fmt == 'KEEP (original)':
+                fmt = os.path.splitext(fname)[1].replace('.', '').upper() or 'JPEG'
+                if fmt == 'JPG':
+                    fmt = 'JPEG'
+            fmt = fmt.upper()
 
-        if mode == 'Target file size':
-            # compute target bytes
-            if size_unit == 'KB':
-                target_bytes = int(size_input * 1024)
-            else:
-                target_bytes = int(size_input * 1024 * 1024)
+            converted = None
+            used_quality = None
 
-            # If user wants KEEP original format and original is already under target, just keep
-            if fmt in ('PNG','JPEG','WEBP','BMP'):
-                # attempt binary search on quality for JPEG/WEBP
-                # If format is PNG and we want to reduce, convert to prefer_format
-                preferred = prefer_format_when_size
-                if fmt == 'PNG' and preferred in ('JPEG','WEBP'):
-                    # convert to preferred before searching
-                    tmp_img = img.copy()
-                    b, q = target_size_binary_search(tmp_img, preferred, target_bytes, dpi=(dpi,dpi) if 'dpi' in locals() else None)
-                    converted = b
-                    used_quality = q
-                    out_ext = preferred.lower()
+            if mode == 'Target file size':
+                # compute target bytes
+                if size_unit == 'KB':
+                    target_bytes = int(size_input * 1024)
                 else:
-                    # try current format first
-                    b, q = target_size_binary_search(img, fmt, target_bytes, dpi=(dpi,dpi) if 'dpi' in locals() else None)
-                    converted = b
-                    used_quality = q
-                    out_ext = fmt.lower()
+                    target_bytes = int(size_input * 1024 * 1024)
 
-        else:
-            # Target resolution
-            if res_mode == 'Pixels':
-                target_w = int(round(w_val))
-                target_h = int(round(h_val))
-            elif res_mode == 'Centimeters':
-                target_w = cm_to_pixels(w_val, dpi)
-                target_h = cm_to_pixels(h_val, dpi)
+                # If user wants KEEP original format and original is already under target, just keep
+                if fmt in ('PNG','JPEG','WEBP','BMP'):
+                    # attempt binary search on quality for JPEG/WEBP
+                    # If format is PNG and we want to reduce, convert to prefer_format
+                    preferred = prefer_format_when_size
+                    if fmt == 'PNG' and preferred in ('JPEG','WEBP'):
+                        # convert to preferred before searching
+                        tmp_img = img.copy()
+                        b, q = target_size_binary_search(tmp_img, preferred, target_bytes, dpi=(dpi,dpi) if 'dpi' in locals() else None)
+                        converted = b
+                        used_quality = q
+                        out_ext = preferred.lower()
+                    else:
+                        # try current format first
+                        b, q = target_size_binary_search(img, fmt, target_bytes, dpi=(dpi,dpi) if 'dpi' in locals() else None)
+                        converted = b
+                        used_quality = q
+                        out_ext = fmt.lower()
+
             else:
-                target_w = inches_to_pixels(w_val, dpi)
-                target_h = inches_to_pixels(h_val, dpi)
+                # Target resolution
+                if res_mode == 'Pixels':
+                    target_w = int(round(w_val))
+                    target_h = int(round(h_val))
+                elif res_mode == 'Centimeters':
+                    target_w = cm_to_pixels(w_val, dpi)
+                    target_h = cm_to_pixels(h_val, dpi)
+                else:
+                    target_w = inches_to_pixels(w_val, dpi)
+                    target_h = inches_to_pixels(h_val, dpi)
 
-            resized = resize_by_pixels(img, target_w, target_h, keep_aspect)
-            # Save with default quality
-            save_fmt = fmt if fmt != 'BMP' else 'PNG'  # BMP no compression -> avoid large
-            b = image_to_bytes(resized, save_fmt, quality=85, dpi=(dpi,dpi) if 'dpi' in locals() else None)
-            converted = b
-            out_ext = save_fmt.lower()
+                resized = resize_by_pixels(img, target_w, target_h, keep_aspect)
+                # Save with default quality
+                save_fmt = fmt if fmt != 'BMP' else 'PNG'  # BMP no compression -> avoid large
+                b = image_to_bytes(resized, save_fmt, quality=85, dpi=(dpi,dpi) if 'dpi' in locals() else None)
+                converted = b
+                out_ext = save_fmt.lower()
 
-        if converted is None:
-            # fallback: save as jpeg at moderate quality
-            converted = image_to_bytes(img, 'JPEG', quality=85)
-            out_ext = 'jpg'
+            if converted is None:
+                # fallback: save as jpeg at moderate quality
+                converted = image_to_bytes(img, 'JPEG', quality=85)
+                out_ext = 'jpg'
 
-        safe_name = os.path.splitext(fname)[0]
-        out_name = f"{safe_name}_resized.{out_ext}"
-        output_files.append((out_name, converted))
+            safe_name = os.path.splitext(fname)[0]
+            out_name = f"{safe_name}_resized.{out_ext}"
+            output_files.append((out_name, converted))
 
-        progress.progress(int(i/total * 100))
+            # Update progress (overall)
+            progress.progress(int(processed / total * 100))
+
+            # free memory for this image
+            try:
+                del img
+            except Exception:
+                pass
+
+        # after each chunk, run garbage collection to free memory
+        gc.collect()
 
     # Package into zip
     zip_buf = io.BytesIO()
