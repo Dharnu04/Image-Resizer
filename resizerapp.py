@@ -299,7 +299,7 @@ if run and images:
         for idx in range(preview_count):
             name, b = output_files[idx]
             with cols[idx]:
-                st.image(b, caption=name, use_column_width=True)
+                st.image(b, caption=name, use_container_width=True)
 
     st.download_button('Download ZIP', data=zip_bytes, file_name=f"{output_name}.zip", mime='application/zip')
 
